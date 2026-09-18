@@ -68,6 +68,27 @@ function daysBetween(startDate, endDate) {
 let todayKey = localDateKey();
 const storeNames = ["tasks", "reflections", "projects", "subtasks", "recurring_tasks", "task_instances", "completion_records", "settings"];
 const syncChannel = "BroadcastChannel" in window ? new BroadcastChannel("warmtodo-sync") : null;
+const supabaseTable = "warmtodo_records";
+const defaultSupabaseUrl = "https://jbobamlppbqvdexzxgjr.supabase.co";
+const supabaseConfigKey = "warmtodo_supabase_config";
+
+function readSupabaseConfig() {
+  const fromWindow = window.WARMTODO_SUPABASE || {};
+  let saved = {};
+  try {
+    saved = JSON.parse(localStorage.getItem(supabaseConfigKey) || "{}");
+  } catch {
+    saved = {};
+  }
+  return {
+    url: defaultSupabaseUrl,
+    anonKey: "",
+    enabled: false,
+    lastSync: "",
+    ...fromWindow,
+    ...saved
+  };
+}
 
 let state = {
   db: null,
@@ -103,6 +124,8 @@ let state = {
   appSettings: {
     defaultTag: "other"
   },
+  supabaseSettings: readSupabaseConfig(),
+  cloudStatus: "idle",
   customTags: [],
   weeklyNotes: {},
   quickAddTag: "work",
@@ -157,7 +180,7 @@ function tx(storeName, mode = "readonly") {
   return state.db.transaction(storeName, mode).objectStore(storeName);
 }
 
-function getAll(storeName) {
+function localGetAll(storeName) {
   return new Promise((resolve, reject) => {
     const req = tx(storeName).getAll();
     req.onsuccess = () => resolve(req.result || []);
@@ -165,11 +188,11 @@ function getAll(storeName) {
   });
 }
 
-function put(storeName, value) {
+function localPut(storeName, value, shouldBroadcast = true) {
   return new Promise((resolve, reject) => {
     const req = tx(storeName, "readwrite").put(value);
     req.onsuccess = () => {
-      if (storeName !== "settings") broadcastSync(`${storeName}:put`);
+      if (shouldBroadcast && storeName !== "settings") broadcastSync(`${storeName}:put`);
       resolve();
     };
     req.onerror = () => reject(req.error);
@@ -180,15 +203,114 @@ function broadcastSync(reason = "data-change") {
   syncChannel?.postMessage({ source: "main", reason, at: Date.now() });
 }
 
-function remove(storeName, id) {
+function localRemove(storeName, id, shouldBroadcast = true) {
   return new Promise((resolve, reject) => {
     const req = tx(storeName, "readwrite").delete(id);
     req.onsuccess = () => {
-      broadcastSync(`${storeName}:remove`);
+      if (shouldBroadcast) broadcastSync(`${storeName}:remove`);
       resolve();
     };
     req.onerror = () => reject(req.error);
   });
+}
+
+function supabaseReady() {
+  return Boolean(state.supabaseSettings?.enabled && state.supabaseSettings?.url && state.supabaseSettings?.anonKey);
+}
+
+function supabaseHeaders(extra = {}) {
+  const key = state.supabaseSettings.anonKey;
+  return {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+    ...extra
+  };
+}
+
+function supabaseBaseUrl(path) {
+  return `${state.supabaseSettings.url.replace(/\/$/, "")}/rest/v1/${path}`;
+}
+
+async function supabaseRequest(path, options = {}) {
+  const response = await fetch(supabaseBaseUrl(path), {
+    ...options,
+    headers: supabaseHeaders(options.headers || {})
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Supabase ${response.status}: ${detail || response.statusText}`);
+  }
+  if (response.status === 204) return null;
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function cloudGetAll(storeName) {
+  const rows = await supabaseRequest(`${supabaseTable}?store_name=eq.${encodeURIComponent(storeName)}&select=id,data,updated_at&order=updated_at.asc`);
+  return (rows || []).map(row => row.data).filter(Boolean);
+}
+
+async function cloudPut(storeName, value) {
+  const payload = {
+    store_name: storeName,
+    id: value.id,
+    data: value,
+    updated_at: value.updated_at || value.updatedAt || nowIso()
+  };
+  await supabaseRequest(`${supabaseTable}?on_conflict=store_name,id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates" },
+    body: JSON.stringify(payload)
+  });
+}
+
+async function cloudRemove(storeName, id) {
+  await supabaseRequest(`${supabaseTable}?store_name=eq.${encodeURIComponent(storeName)}&id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE"
+  });
+}
+
+async function getAll(storeName) {
+  if (!supabaseReady()) return localGetAll(storeName);
+  try {
+    const cloudItems = await cloudGetAll(storeName);
+    for (const item of cloudItems) await localPut(storeName, item, false);
+    state.cloudStatus = "connected";
+    return cloudItems;
+  } catch (error) {
+    console.error(error);
+    state.cloudStatus = "offline";
+    return localGetAll(storeName);
+  }
+}
+
+async function put(storeName, value) {
+  if (supabaseReady()) {
+    try {
+      await cloudPut(storeName, value);
+      state.cloudStatus = "connected";
+    } catch (error) {
+      console.error(error);
+      state.cloudStatus = "offline";
+      toast("云端保存失败，已先保存在本地。");
+    }
+  }
+  await localPut(storeName, value);
+}
+
+async function remove(storeName, id) {
+  if (supabaseReady()) {
+    try {
+      await cloudRemove(storeName, id);
+      state.cloudStatus = "connected";
+    } catch (error) {
+      console.error(error);
+      state.cloudStatus = "offline";
+      toast("云端删除失败，本地已继续处理。");
+    }
+  }
+  await localRemove(storeName, id);
 }
 
 async function migrateInlineSubtasks() {
@@ -417,7 +539,7 @@ function openWidgetWindow() {
 async function exportData() {
   try {
     const payload = {};
-    for (const name of storeNames) payload[name] = await getAll(name);
+    for (const name of storeNames) payload[name] = await localGetAll(name);
     const blob = new Blob([JSON.stringify({ exported_at: nowIso(), version: "phase-10", data: payload }, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -429,6 +551,77 @@ async function exportData() {
   } catch (error) {
     console.error(error);
     toast("导出失败，请稍后再试。");
+  }
+}
+
+function persistSupabaseConfig(next) {
+  state.supabaseSettings = { ...state.supabaseSettings, ...next };
+  localStorage.setItem(supabaseConfigKey, JSON.stringify(state.supabaseSettings));
+}
+
+async function saveSupabaseSettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  persistSupabaseConfig({
+    url: form.supabase_url.value.trim() || defaultSupabaseUrl,
+    anonKey: form.supabase_anon_key.value.trim(),
+    enabled: form.supabase_enabled.checked
+  });
+  toast(state.supabaseSettings.enabled ? "Supabase 云端已启用。" : "Supabase 云端已关闭。");
+  render();
+}
+
+async function testSupabaseConnection() {
+  if (!supabaseReady()) return toast("请先填写 Supabase anon key 并启用云端。");
+  try {
+    await supabaseRequest(`${supabaseTable}?select=store_name,id&limit=1`);
+    state.cloudStatus = "connected";
+    persistSupabaseConfig({ lastSync: nowIso() });
+    await load();
+    toast("Supabase 连接成功。");
+  } catch (error) {
+    console.error(error);
+    state.cloudStatus = "offline";
+    render();
+    toast("Supabase 连接失败，请检查 SQL 表和 anon key。");
+  }
+}
+
+async function pushLocalToSupabase() {
+  if (!supabaseReady()) return toast("请先填写 Supabase anon key 并启用云端。");
+  try {
+    for (const name of storeNames) {
+      const items = await localGetAll(name);
+      for (const item of items) await cloudPut(name, item);
+    }
+    state.cloudStatus = "connected";
+    persistSupabaseConfig({ lastSync: nowIso() });
+    await load();
+    toast("本地数据已上传到 Supabase。");
+  } catch (error) {
+    console.error(error);
+    state.cloudStatus = "offline";
+    render();
+    toast("上传失败，请检查 Supabase 配置。");
+  }
+}
+
+async function pullSupabaseToLocal() {
+  if (!supabaseReady()) return toast("请先填写 Supabase anon key 并启用云端。");
+  try {
+    for (const name of storeNames) {
+      const items = await cloudGetAll(name);
+      for (const item of items) await localPut(name, item, false);
+    }
+    state.cloudStatus = "connected";
+    persistSupabaseConfig({ lastSync: nowIso() });
+    await load();
+    toast("Supabase 数据已同步到本地缓存。");
+  } catch (error) {
+    console.error(error);
+    state.cloudStatus = "offline";
+    render();
+    toast("同步失败，请检查 Supabase 配置。");
   }
 }
 
@@ -2790,6 +2983,10 @@ function renderCalendarAside() {
 
 function renderSettings() {
   const settings = state.widgetSettings;
+  const cloud = state.supabaseSettings;
+  const cloudStatus = supabaseReady()
+    ? state.cloudStatus === "connected" ? "Connected" : state.cloudStatus === "offline" ? "Offline / Local fallback" : "Configured"
+    : "Local only";
   return `
     <main class="main">
       <div class="topbar compact">
@@ -2803,6 +3000,22 @@ function renderSettings() {
       <section class="settings-stack">
         <div class="settings-panel card"><h2>General</h2><div class="settings-grid"><div class="setting-row"><span>Local-first storage</span><strong>Enabled</strong></div><div class="setting-row"><span>Completed Tasks Never Disappear</span><strong>Enabled</strong></div></div></div>
         <div class="settings-panel card"><h2>Tasks</h2><div class="settings-grid"><div class="setting-row"><span>Default Tag</span><strong>${tagByKey(state.appSettings.defaultTag)?.label || "其他"}</strong></div><div class="setting-row"><span>Unfinished Previous Tasks</span><strong>Manual Review</strong></div></div></div>
+        <div class="settings-panel card">
+          <h2>Cloud Storage</h2>
+          <form class="settings-grid" onsubmit="saveSupabaseSettings(event)">
+            <label class="setting-row"><span>Enable Supabase</span><input type="checkbox" name="supabase_enabled" ${cloud.enabled ? "checked" : ""} /></label>
+            <label class="setting-row"><span>Project URL</span><input class="field" name="supabase_url" value="${escapeHtml(cloud.url || defaultSupabaseUrl)}" placeholder="https://project.supabase.co" /></label>
+            <label class="setting-row"><span>Anon Key</span><input class="field" name="supabase_anon_key" type="password" value="${escapeHtml(cloud.anonKey || "")}" placeholder="Supabase anon public key" /></label>
+            <div class="setting-row"><span>Status</span><strong>${cloudStatus}</strong></div>
+            <div class="setting-row"><span>Last Sync</span><strong>${cloud.lastSync ? formatTime(cloud.lastSync) : "Never"}</strong></div>
+            <div class="setting-actions">
+              <button class="secondary-button" type="submit">保存云端设置</button>
+              <button class="secondary-button" type="button" onclick="testSupabaseConnection()">测试连接</button>
+              <button class="secondary-button" type="button" onclick="pushLocalToSupabase()">上传本地数据</button>
+              <button class="secondary-button" type="button" onclick="pullSupabaseToLocal()">拉取云端数据</button>
+            </div>
+          </form>
+        </div>
         <div class="settings-panel card">
           <h2>Desktop Widget</h2>
           <div class="settings-grid">
@@ -2818,7 +3031,7 @@ function renderSettings() {
           </div>
         </div>
         <div class="settings-panel card"><h2>Appearance</h2><div class="settings-grid"><div class="setting-row"><span>Theme</span><strong>Warm Minimal</strong></div><div class="setting-row"><span>Motion</span><strong>150–250ms</strong></div></div></div>
-        <div class="settings-panel card"><h2>Data</h2><div class="settings-grid"><div class="setting-row"><span>Export Data</span><button class="secondary-button" onclick="exportData()">Export JSON</button></div><div class="setting-row"><span>Import / Restore</span><strong>Not enabled</strong></div></div></div>
+        <div class="settings-panel card"><h2>Data</h2><div class="settings-grid"><div class="setting-row"><span>Export Data</span><button class="secondary-button" onclick="exportData()">Export JSON</button></div><div class="setting-row"><span>Storage</span><strong>${supabaseReady() ? "Supabase + Local cache" : "IndexedDB Local"}</strong></div><div class="setting-row"><span>Import / Restore</span><strong>Not enabled</strong></div></div></div>
       </section>
     </main>
   `;
@@ -3253,7 +3466,7 @@ Object.assign(window, {
   saveWidgetSetting, openWidgetWindow, setGlobalSearch, moveTaskToToday, changeTaskDate, dropTask,
   moveTaskToProject, copyTask, createQuickTag, createQuickProject, openTaskMenu, closeFloatingMenu, menuAction,
   skipRecurringInstance, deleteRecurringInstance, editRecurringFromInstance, deleteRecurringSeriesFromInstance,
-  exportData
+  exportData, saveSupabaseSettings, testSupabaseConnection, pushLocalToSupabase, pullSupabaseToLocal
 });
 
 boot().catch(error => {

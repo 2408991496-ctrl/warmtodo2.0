@@ -8,8 +8,26 @@ const widgetTags = {
 
 const widgetChannel = "BroadcastChannel" in window ? new BroadcastChannel("warmtodo-sync") : null;
 const widgetStores = ["tasks", "reflections", "projects", "subtasks", "recurring_tasks", "task_instances", "completion_records", "settings"];
+const widgetSupabaseTable = "warmtodo_records";
+const widgetSupabaseConfigKey = "warmtodo_supabase_config";
+const widgetDefaultSupabaseUrl = "https://jbobamlppbqvdexzxgjr.supabase.co";
+
+function widgetReadSupabaseConfig() {
+  try {
+    return {
+      url: widgetDefaultSupabaseUrl,
+      anonKey: "",
+      enabled: false,
+      ...JSON.parse(localStorage.getItem(widgetSupabaseConfigKey) || "{}")
+    };
+  } catch {
+    return { url: widgetDefaultSupabaseUrl, anonKey: "", enabled: false };
+  }
+}
+
 let widgetState = {
   db: null,
+  supabaseSettings: widgetReadSupabaseConfig(),
   tasks: [],
   projects: [],
   subtasks: [],
@@ -62,7 +80,7 @@ function widgetTx(storeName, mode = "readonly") {
   return widgetState.db.transaction(storeName, mode).objectStore(storeName);
 }
 
-function widgetGetAll(storeName) {
+function widgetLocalGetAll(storeName) {
   return new Promise((resolve, reject) => {
     const req = widgetTx(storeName).getAll();
     req.onsuccess = () => resolve(req.result || []);
@@ -70,15 +88,87 @@ function widgetGetAll(storeName) {
   });
 }
 
-function widgetPut(storeName, value) {
+function widgetLocalPut(storeName, value, shouldBroadcast = true) {
   return new Promise((resolve, reject) => {
     const req = widgetTx(storeName, "readwrite").put(value);
     req.onsuccess = () => {
-      widgetBroadcast(`${storeName}:put`);
+      if (shouldBroadcast) widgetBroadcast(`${storeName}:put`);
       resolve();
     };
     req.onerror = () => reject(req.error);
   });
+}
+
+function widgetSupabaseReady() {
+  return Boolean(widgetState.supabaseSettings?.enabled && widgetState.supabaseSettings?.url && widgetState.supabaseSettings?.anonKey);
+}
+
+function widgetSupabaseHeaders(extra = {}) {
+  const key = widgetState.supabaseSettings.anonKey;
+  return {
+    apikey: key,
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+    ...extra
+  };
+}
+
+function widgetSupabaseUrl(path) {
+  return `${widgetState.supabaseSettings.url.replace(/\/$/, "")}/rest/v1/${path}`;
+}
+
+async function widgetSupabaseRequest(path, options = {}) {
+  const response = await fetch(widgetSupabaseUrl(path), {
+    ...options,
+    headers: widgetSupabaseHeaders(options.headers || {})
+  });
+  if (!response.ok) throw new Error(await response.text());
+  if (response.status === 204) return null;
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function widgetCloudGetAll(storeName) {
+  const rows = await widgetSupabaseRequest(`${widgetSupabaseTable}?store_name=eq.${encodeURIComponent(storeName)}&select=id,data,updated_at&order=updated_at.asc`);
+  return (rows || []).map(row => row.data).filter(Boolean);
+}
+
+async function widgetCloudPut(storeName, value) {
+  await widgetSupabaseRequest(`${widgetSupabaseTable}?on_conflict=store_name,id`, {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates" },
+    body: JSON.stringify({
+      store_name: storeName,
+      id: value.id,
+      data: value,
+      updated_at: value.updated_at || value.updatedAt || widgetNowIso()
+    })
+  });
+}
+
+async function widgetGetAll(storeName) {
+  widgetState.supabaseSettings = widgetReadSupabaseConfig();
+  if (!widgetSupabaseReady()) return widgetLocalGetAll(storeName);
+  try {
+    const items = await widgetCloudGetAll(storeName);
+    for (const item of items) await widgetLocalPut(storeName, item, false);
+    return items;
+  } catch (error) {
+    console.error(error);
+    return widgetLocalGetAll(storeName);
+  }
+}
+
+async function widgetPut(storeName, value) {
+  widgetState.supabaseSettings = widgetReadSupabaseConfig();
+  if (widgetSupabaseReady()) {
+    try {
+      await widgetCloudPut(storeName, value);
+    } catch (error) {
+      console.error(error);
+    }
+  }
+  await widgetLocalPut(storeName, value);
 }
 
 function widgetBroadcast(reason) {

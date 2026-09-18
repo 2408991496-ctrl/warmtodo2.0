@@ -2716,6 +2716,13 @@ textarea:focus-visible {
   accent-color: var(--green);
 }
 
+.setting-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-top: 6px;
+}
+
 .analytics-panel {
   display: grid;
   gap: 14px;
